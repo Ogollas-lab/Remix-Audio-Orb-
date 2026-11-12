@@ -51,8 +51,12 @@ async function startServer() {
       const result = await searchWithGrounding(query);
       res.json(result);
     } catch (err) {
-      console.error('Search grounding error:', err);
       const {status, message} = formatGeminiError(err);
+      if (status >= 500) {
+        console.error('Search grounding error:', err);
+      } else {
+        console.warn(`Search grounding returned ${status}: ${message}`);
+      }
       res.status(status).json({error: message});
     }
   });
@@ -76,8 +80,12 @@ async function startServer() {
       const result = await mapsWithGrounding(query, coords);
       res.json(result);
     } catch (err) {
-      console.error('Maps grounding error:', err);
       const {status, message} = formatGeminiError(err);
+      if (status >= 500) {
+        console.error('Maps grounding error:', err);
+      } else {
+        console.warn(`Maps grounding returned ${status}: ${message}`);
+      }
       res.status(status).json({error: message});
     }
   });
@@ -231,6 +239,51 @@ async function startServer() {
       },
       appType: 'spa',
     });
+
+    // Keep Vite HMR disabled without triggering client WebSocket connection errors
+    app.get('/@vite/client', (_req: Request, res: Response) => {
+      res.type('application/javascript').send(`
+const sheetsMap = new Map();
+export function updateStyle(id, content) {
+  let style = sheetsMap.get(id);
+  if (!style) {
+    style = document.createElement('style');
+    style.setAttribute('type', 'text/css');
+    style.setAttribute('data-vite-dev-id', id);
+    style.textContent = content;
+    document.head.appendChild(style);
+    sheetsMap.set(id, style);
+  } else {
+    style.textContent = content;
+  }
+}
+export function removeStyle(id) {
+  const style = sheetsMap.get(id);
+  if (style) {
+    style.remove();
+    sheetsMap.delete(id);
+  }
+}
+export function createHotContext() {
+  return {
+    accept() {},
+    dispose() {},
+    prune() {},
+    decline() {},
+    invalidate() {},
+    on() {},
+    off() {},
+    send() {},
+    data: {},
+  };
+}
+export function injectQuery(url) {
+  return url;
+}
+export class ErrorOverlay extends HTMLElement {}
+`);
+    });
+
     app.use(vite.middlewares);
   }
 

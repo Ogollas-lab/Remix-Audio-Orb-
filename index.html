@@ -8,6 +8,10 @@
   <meta property="og:title" content="Remix Audio Orb">
   <meta property="og:description" content="Speak, and the orb responds. An interactive experience powered by the Live Audio API.">
   <link rel="stylesheet" href="/index.css">
+  <script>
+    globalThis.litIssuedWarnings = globalThis.litIssuedWarnings || new Set();
+    globalThis.litIssuedWarnings.add('dev-mode');
+  </script>
 </head>
 <body>
   <gdm-live-audio></gdm-live-audio>

@@ -1590,6 +1590,9 @@ export class GdmLiveAudio extends LitElement {
   }
 
   private openDrawer(tab: 'search' | 'maps' | 'customize' | 'settings' | 'transcripts') {
+    if (this.activeGroundingTab !== tab) {
+      this.groundingError = '';
+    }
     this.activeGroundingTab = tab;
     this.isGroundingDrawerOpen = true;
     this.isOverflowMenuOpen = false;
@@ -1609,8 +1612,9 @@ export class GdmLiveAudio extends LitElement {
       this.addTranscript('user', `[Search] ${q}`);
       this.addTranscript('model', result.text);
     } catch (err: any) {
-      console.error('Search grounding error:', err);
-      this.groundingError = err?.message || 'Search grounding request failed.';
+      const msg = err?.message || 'Search grounding request failed.';
+      console.warn('Search grounding unavailable:', msg);
+      this.groundingError = msg;
     } finally {
       this.isGroundingLoading = false;
     }
@@ -1647,8 +1651,9 @@ export class GdmLiveAudio extends LitElement {
       this.addTranscript('user', `[Maps] ${q}`);
       this.addTranscript('model', result.text);
     } catch (err: any) {
-      console.error('Maps grounding error:', err);
-      this.groundingError = err?.message || 'Maps grounding request failed.';
+      const msg = err?.message || 'Maps grounding request failed.';
+      console.warn('Maps grounding unavailable:', msg);
+      this.groundingError = msg;
     } finally {
       this.isGroundingLoading = false;
     }
