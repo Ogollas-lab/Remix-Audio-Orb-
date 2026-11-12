@@ -2,7 +2,10 @@
  * @license
  * SPDX-License-Identifier: Apache-2.0
 */
-import {Blob} from '@google/genai';
+export interface AudioBlob {
+  data: string;
+  mimeType: string;
+}
 
 function encode(bytes: Uint8Array): string {
   let binary = '';
@@ -23,7 +26,7 @@ function decode(base64: string): Uint8Array {
   return bytes;
 }
 
-function createBlob(data: Float32Array): Blob {
+function createBlob(data: Float32Array): AudioBlob {
   const l = data.length;
   const int16 = new Int16Array(l);
   for (let i = 0; i < l; i++) {

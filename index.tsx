@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import {GoogleGenAI, LiveServerMessage, Modality, Session} from '@google/genai';
 import {LitElement, css, html} from 'lit';
 import {customElement, state} from 'lit/decorators.js';
 import {createBlob, decode, decodeAudioData} from './utils';
@@ -12,6 +11,22 @@ import './visual-3d';
 import './audio-reactive-orb';
 import {GroundingResult, GroundingService} from './grounding-service';
 import {ORB_THEMES} from './audio-reactive-orb';
+import './maps-explorer';
+
+// Case A Tier 1: Global Google Maps Platform quota & auth failure detection
+if (typeof window !== 'undefined') {
+  (window as unknown as {gm_authFailure?: () => void}).gm_authFailure = () => {
+    window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
+  };
+  const origConsoleError = console.error;
+  console.error = (...args: unknown[]) => {
+    origConsoleError.apply(console, args);
+    const msg = args.map((a) => String(a)).join(' ');
+    if (msg.includes('OverQuotaMapError') || msg.includes('QuotaExceededError')) {
+      window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
+    }
+  };
+}
 
 export interface ChatMessage {
   role: 'user' | 'model' | 'system';
@@ -54,9 +69,11 @@ export class GdmLiveAudio extends LitElement {
   @state() groundingResult: GroundingResult | null = null;
   @state() groundingError = '';
   @state() isSpeakingGrounding = false;
+  @state() private mapsQuotaExceeded = false;
+  @state() private isDockCollapsed = false;
 
-  private client: GoogleGenAI;
-  private session: Session;
+  private liveSocket: WebSocket | null = null;
+  private liveConnectPromise: Promise<void> | null = null;
   private groundingService = new GroundingService();
 
   private inputAudioContext = new (window.AudioContext ||
@@ -86,6 +103,32 @@ export class GdmLiveAudio extends LitElement {
       background: #06030c;
     }
 
+    /* Sticky Case A Quota Warning Banner */
+    .gmp-quota-banner {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 90;
+      background: #fffbeb;
+      border-bottom: 1px solid #fde68a;
+      color: #78350f;
+      padding: 0.45rem 1rem;
+      font-size: 0.78rem;
+      text-align: center;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+    }
+
+    .gmp-quota-banner a {
+      color: #451a03;
+      font-weight: 600;
+      text-decoration: underline;
+    }
+
+    .gmp-quota-banner a:hover {
+      color: #92400e;
+    }
+
     /* ==========================================================================
        Clean Professional Header
        ========================================================================== */
@@ -101,9 +144,7 @@ export class GdmLiveAudio extends LitElement {
       justify-content: space-between;
       gap: 0.75rem;
       padding: 0 0.85rem;
-      background: rgba(14, 10, 26, 0.78);
-      backdrop-filter: blur(24px);
-      -webkit-backdrop-filter: blur(24px);
+      background: rgba(14, 10, 26, 0.92);
       border: 1px solid rgba(255, 255, 255, 0.12);
       border-radius: 12px;
       box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.08);
@@ -112,6 +153,11 @@ export class GdmLiveAudio extends LitElement {
       box-sizing: border-box;
       max-width: calc(100vw - 2.5rem);
       margin: 0 auto;
+      transition: top 0.2s ease;
+    }
+
+    .app-header.has-banner {
+      top: 3.25rem;
     }
 
     /* Left: Logo + Name + Status */
@@ -188,12 +234,6 @@ export class GdmLiveAudio extends LitElement {
     .status-badge.recording .dot {
       background: #f43f5e;
       box-shadow: 0 0 10px #f43f5e;
-      animation: pulse-dot 1s infinite alternate;
-    }
-
-    @keyframes pulse-dot {
-      from { transform: scale(0.9); opacity: 0.7; }
-      to { transform: scale(1.3); opacity: 1; }
     }
 
     /* Center: Current Mode / Status */
@@ -247,7 +287,6 @@ export class GdmLiveAudio extends LitElement {
       font-size: 0.74rem;
       font-weight: 500;
       cursor: pointer;
-      backdrop-filter: blur(12px);
       transition: all 0.18s ease;
       white-space: nowrap;
       outline: none;
@@ -304,9 +343,7 @@ export class GdmLiveAudio extends LitElement {
       position: absolute;
       top: 56px;
       right: 1.25rem;
-      background: rgba(18, 14, 34, 0.95);
-      backdrop-filter: blur(28px);
-      -webkit-backdrop-filter: blur(28px);
+      background: rgba(18, 14, 34, 0.96);
       border: 1px solid rgba(255, 255, 255, 0.14);
       border-radius: 12px;
       padding: 0.5rem;
@@ -420,6 +457,13 @@ export class GdmLiveAudio extends LitElement {
       pointer-events: auto;
       width: max-content;
       max-width: 95vw;
+      transition: opacity 0.25s ease, transform 0.25s ease;
+    }
+
+    .control-panel.collapsed {
+      opacity: 0;
+      pointer-events: none;
+      transform: translate(-50%, 16px);
     }
 
     /* ROW 1 — Audio Category Indicators (Equal-width Grid Columns) */
@@ -430,10 +474,8 @@ export class GdmLiveAudio extends LitElement {
       justify-items: center;
       gap: 12px;
       width: min(360px, 90vw);
-      background: rgba(12, 8, 22, 0.78);
+      background: rgba(12, 8, 22, 0.9);
       border: 1px solid rgba(255, 255, 255, 0.11);
-      backdrop-filter: blur(16px);
-      -webkit-backdrop-filter: blur(16px);
       padding: 0.38rem 0.95rem 0.45rem;
       border-radius: 9999px;
       box-shadow: 0 4px 20px rgba(0, 0, 0, 0.42);
@@ -531,8 +573,7 @@ export class GdmLiveAudio extends LitElement {
       border: 1px solid rgba(255, 255, 255, 0.16);
       color: white;
       border-radius: 9999px;
-      background: rgba(16, 12, 30, 0.75);
-      backdrop-filter: blur(16px);
+      background: rgba(16, 12, 30, 0.9);
       width: 48px;
       height: 48px;
       cursor: pointer;
@@ -547,7 +588,7 @@ export class GdmLiveAudio extends LitElement {
     }
 
     .ctrl-btn:hover:not([disabled]) {
-      background: rgba(45, 35, 75, 0.85);
+      background: rgba(45, 35, 75, 0.92);
       border-color: rgba(255, 255, 255, 0.35);
       transform: translateY(-2px);
     }
@@ -565,42 +606,29 @@ export class GdmLiveAudio extends LitElement {
     .mic-btn {
       width: 60px;
       height: 60px;
-      background: rgba(239, 68, 68, 0.2);
-      border: 1.5px solid rgba(239, 68, 68, 0.6);
-      box-shadow: 0 0 20px rgba(239, 68, 68, 0.25);
+      background: rgba(239, 68, 68, 0.24);
+      border: 1.5px solid rgba(239, 68, 68, 0.65);
+      box-shadow: 0 0 20px rgba(239, 68, 68, 0.28);
       flex-shrink: 0;
     }
 
     .mic-btn:hover:not([disabled]) {
-      background: rgba(239, 68, 68, 0.35);
-      border-color: rgba(239, 68, 68, 0.9);
+      background: rgba(239, 68, 68, 0.38);
+      border-color: rgba(239, 68, 68, 0.95);
     }
 
     .mic-btn.recording {
-      background: rgba(239, 68, 68, 0.85);
-      border-color: #ef4444;
-      animation: mic-pulse 1.8s infinite;
-    }
-
-    @keyframes mic-pulse {
-      0% {
-        box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
-      }
-      70% {
-        box-shadow: 0 0 0 14px rgba(239, 68, 68, 0);
-      }
-      100% {
-        box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
-      }
+      background: rgba(239, 68, 68, 0.88);
+      border-color: #f87171;
+      box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.28), 0 0 24px rgba(239, 68, 68, 0.45);
     }
 
     .view-switch-btn {
       outline: none;
       border: 1px solid rgba(255, 255, 255, 0.14);
-      color: rgba(255, 255, 255, 0.85);
+      color: rgba(255, 255, 255, 0.88);
       border-radius: 9999px;
-      background: rgba(16, 12, 30, 0.75);
-      backdrop-filter: blur(16px);
+      background: rgba(16, 12, 30, 0.9);
       height: 40px;
       padding: 0 13px;
       font-size: 0.74rem;
@@ -672,11 +700,9 @@ export class GdmLiveAudio extends LitElement {
       align-items: center;
       gap: 0.65rem;
       padding: 0.30rem 0.95rem;
-      background: rgba(11, 8, 20, 0.78);
+      background: rgba(11, 8, 20, 0.9);
       border: 1px solid rgba(255, 255, 255, 0.10);
       border-radius: 9999px;
-      backdrop-filter: blur(18px);
-      -webkit-backdrop-filter: blur(18px);
       font-size: 0.74rem;
       font-weight: 500;
       color: #94a3b8;
@@ -686,6 +712,47 @@ export class GdmLiveAudio extends LitElement {
       transition: all 0.3s ease;
       user-select: none;
       letter-spacing: 0.02em;
+    }
+
+    /* Zen Mode Collapsible Dock Toggle */
+    .zen-toggle-btn {
+      position: absolute;
+      bottom: 0.85rem;
+      right: 1.25rem;
+      z-index: 32;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.32rem 0.72rem;
+      background: rgba(14, 10, 26, 0.92);
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 9999px;
+      color: #cbd5e1;
+      font-size: 0.72rem;
+      font-weight: 500;
+      cursor: pointer;
+      pointer-events: auto;
+      transition: all 0.2s ease;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+    }
+
+    .zen-toggle-btn:hover {
+      background: rgba(30, 24, 54, 0.96);
+      border-color: rgba(56, 189, 248, 0.5);
+      color: #38bdf8;
+    }
+
+    @media (max-width: 768px) {
+      .zen-toggle-btn {
+        bottom: auto;
+        top: 4.1rem;
+        right: 0.6rem;
+        padding: 0.28rem 0.6rem;
+        font-size: 0.68rem;
+      }
+      .zen-toggle-btn.has-banner {
+        top: 6.4rem;
+      }
     }
 
     .status-live-chip {
@@ -720,15 +787,6 @@ export class GdmLiveAudio extends LitElement {
       border-radius: 50%;
       background: currentColor;
       box-shadow: 0 0 6px currentColor;
-    }
-
-    .status-live-chip.recording .live-dot {
-      animation: dot-pulse 1s infinite alternate;
-    }
-
-    @keyframes dot-pulse {
-      from { opacity: 0.5; transform: scale(0.8); }
-      to { opacity: 1; transform: scale(1.3); }
     }
 
     .status-main-info {
@@ -771,10 +829,8 @@ export class GdmLiveAudio extends LitElement {
       bottom: 0;
       width: 440px;
       max-width: 90vw;
-      background: rgba(14, 10, 26, 0.9);
+      background: rgba(14, 10, 26, 0.96);
       border-left: 1px solid rgba(255, 255, 255, 0.12);
-      backdrop-filter: blur(28px);
-      -webkit-backdrop-filter: blur(28px);
       z-index: 55;
       display: flex;
       flex-direction: column;
@@ -1205,12 +1261,36 @@ export class GdmLiveAudio extends LitElement {
   connectedCallback() {
     super.connectedCallback();
     window.addEventListener('click', this.handleGlobalClick);
+    window.addEventListener('gmp-quota-exceeded', this.handleMapsQuotaExceeded);
+    window.addEventListener('keydown', this.handleGlobalKeydown);
   }
 
   disconnectedCallback() {
     super.disconnectedCallback();
     window.removeEventListener('click', this.handleGlobalClick);
+    window.removeEventListener('gmp-quota-exceeded', this.handleMapsQuotaExceeded);
+    window.removeEventListener('keydown', this.handleGlobalKeydown);
+    this.stopRecording();
+    if (this.liveSocket) {
+      this.liveSocket.close();
+      this.liveSocket = null;
+    }
   }
+
+  private handleMapsQuotaExceeded = () => {
+    this.mapsQuotaExceeded = true;
+  };
+
+  private handleGlobalKeydown = (e: KeyboardEvent) => {
+    const target = e.target as HTMLElement | null;
+    const tag = target?.tagName?.toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || tag === 'select' || target?.isContentEditable) {
+      return;
+    }
+    if ((e.key === 'h' || e.key === 'H') && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      this.isDockCollapsed = !this.isDockCollapsed;
+    }
+  };
 
   private handleGlobalClick = (e: MouseEvent) => {
     // Close overflow menu if clicked outside
@@ -1241,102 +1321,148 @@ export class GdmLiveAudio extends LitElement {
 
   private async initClient() {
     this.initAudio();
-
-    this.client = new GoogleGenAI({
-      apiKey: process.env.GEMINI_API_KEY,
-    });
-
     this.outputNode.connect(this.outputAudioContext.destination);
-
     this.initSession();
   }
 
   /**
-   * Initializes Live API session using gemini-3.8-live
+   * Initializes Live API session via server WebSocket bridge (/api/live)
    */
-  private async initSession() {
-    const model = 'gemini-3.8-live';
-
-    try {
-      this.updateStatus('Connecting to gemini-3.8-live...');
-
-      this.session = await this.client.live.connect({
-        model: model,
-        callbacks: {
-          onopen: () => {
-            this.isConnected = true;
-            this.updateStatus('Connected to gemini-3.8-live');
-          },
-          onmessage: async (message: LiveServerMessage) => {
-            const audio =
-              message.serverContent?.modelTurn?.parts[0]?.inlineData;
-
-            if (audio) {
-              this.nextStartTime = Math.max(
-                this.nextStartTime,
-                this.outputAudioContext.currentTime,
-              );
-
-              const audioBuffer = await decodeAudioData(
-                decode(audio.data),
-                this.outputAudioContext,
-                24000,
-                1,
-              );
-              const source = this.outputAudioContext.createBufferSource();
-              source.buffer = audioBuffer;
-              source.connect(this.outputNode);
-              source.addEventListener('ended', () => {
-                this.sources.delete(source);
-                this.requestUpdate();
-              });
-
-              source.start(this.nextStartTime);
-              this.nextStartTime = this.nextStartTime + audioBuffer.duration;
-              this.sources.add(source);
-              this.requestUpdate();
-            }
-
-            const textPart = message.serverContent?.modelTurn?.parts?.find(
-              (p: any) => p.text,
-            );
-            if (textPart && textPart.text) {
-              this.addTranscript('model', textPart.text);
-            }
-
-            const interrupted = message.serverContent?.interrupted;
-            if (interrupted) {
-              for (const source of this.sources.values()) {
-                source.stop();
-                this.sources.delete(source);
-              }
-              this.nextStartTime = 0;
-              this.requestUpdate();
-            }
-          },
-          onerror: (e: any) => {
-            this.updateError(e?.message || 'Live session encountered an issue.');
-          },
-          onclose: (e: CloseEvent) => {
-            this.isConnected = false;
-            this.updateStatus(e.reason ? `Session closed: ${e.reason}` : 'Session closed');
-          },
-        },
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: {voiceName: this.selectedVoice},
-            },
-          },
-          systemInstruction:
-            'You are an intelligent, engaging voice assistant in the Remix Audio Orb. Keep your responses natural, expressive, concise, and conversational.',
-        },
-      });
-    } catch (e: any) {
-      console.error('Session connection error:', e);
-      this.updateError(e?.message || 'Unable to connect to Live API.');
+  private initSession(): Promise<void> {
+    if (this.liveConnectPromise) {
+      return this.liveConnectPromise;
     }
+
+    if (this.liveSocket) {
+      try {
+        this.liveSocket.close();
+      } catch {
+        // Ignore close errors
+      }
+      this.liveSocket = null;
+    }
+
+    this.isConnected = false;
+    this.updateError('');
+    this.updateStatus('Connecting to gemini-3.8-live...');
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/api/live?voice=${encodeURIComponent(this.selectedVoice)}`;
+
+    const connectPromise = new Promise<void>((resolve) => {
+      let settled = false;
+      const settle = () => {
+        if (!settled) {
+          settled = true;
+          this.liveConnectPromise = null;
+          resolve();
+        }
+      };
+
+      try {
+        const ws = new WebSocket(wsUrl);
+        this.liveSocket = ws;
+
+        ws.addEventListener('message', async (event) => {
+          if (this.liveSocket !== ws) return;
+
+          let msg: {
+            type?: string;
+            data?: string;
+            text?: string;
+            message?: string;
+            reason?: string;
+          };
+          try {
+            msg = JSON.parse(event.data);
+          } catch {
+            return;
+          }
+
+          if (msg.type === 'open') {
+            this.isConnected = true;
+            this.updateError('');
+            this.updateStatus('Connected to gemini-3.8-live');
+            settle();
+            return;
+          }
+
+          if (msg.type === 'audio' && msg.data) {
+            this.nextStartTime = Math.max(
+              this.nextStartTime,
+              this.outputAudioContext.currentTime,
+            );
+
+            const audioBuffer = await decodeAudioData(
+              decode(msg.data),
+              this.outputAudioContext,
+              24000,
+              1,
+            );
+            const source = this.outputAudioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(this.outputNode);
+            source.addEventListener('ended', () => {
+              this.sources.delete(source);
+              this.requestUpdate();
+            });
+
+            source.start(this.nextStartTime);
+            this.nextStartTime = this.nextStartTime + audioBuffer.duration;
+            this.sources.add(source);
+            this.requestUpdate();
+            return;
+          }
+
+          if (msg.type === 'text' && msg.text) {
+            this.addTranscript('model', msg.text);
+            return;
+          }
+
+          if (msg.type === 'interrupted') {
+            for (const source of this.sources.values()) {
+              source.stop();
+              this.sources.delete(source);
+            }
+            this.nextStartTime = 0;
+            this.requestUpdate();
+            return;
+          }
+
+          if (msg.type === 'error') {
+            this.updateError(msg.message || 'Live session encountered an issue.');
+            settle();
+            return;
+          }
+
+          if (msg.type === 'close') {
+            this.isConnected = false;
+            this.updateStatus(msg.reason ? `Session closed: ${msg.reason}` : 'Session closed');
+            settle();
+          }
+        });
+
+        ws.addEventListener('error', () => {
+          if (this.liveSocket !== ws) return;
+          this.isConnected = false;
+          this.updateError('Unable to connect to Live API.');
+          settle();
+        });
+
+        ws.addEventListener('close', () => {
+          if (this.liveSocket !== ws) return;
+          this.isConnected = false;
+          settle();
+        });
+      } catch (e: any) {
+        console.error('Session connection error:', e);
+        this.updateError(e?.message || 'Unable to connect to Live API.');
+        settle();
+      }
+    });
+
+    this.liveConnectPromise = connectPromise;
+    return connectPromise;
   }
 
   private addTranscript(role: 'user' | 'model' | 'system', text: string) {
@@ -1388,15 +1514,26 @@ export class GdmLiveAudio extends LitElement {
       );
 
       this.scriptProcessorNode.onaudioprocess = (audioProcessingEvent) => {
-        if (!this.isRecording || !this.session) return;
+        if (
+          !this.isRecording ||
+          !this.liveSocket ||
+          this.liveSocket.readyState !== WebSocket.OPEN ||
+          !this.isConnected
+        ) {
+          return;
+        }
 
         const inputBuffer = audioProcessingEvent.inputBuffer;
         const pcmData = inputBuffer.getChannelData(0);
         const blob = createBlob(pcmData);
 
-        this.session.sendRealtimeInput({
-          audio: {data: blob.data, mimeType: 'audio/pcm;rate=16000'},
-        });
+        this.liveSocket.send(
+          JSON.stringify({
+            type: 'audio',
+            data: blob.data,
+            mimeType: blob.mimeType,
+          }),
+        );
       };
 
       this.sourceNode.connect(this.scriptProcessorNode);
@@ -1434,7 +1571,15 @@ export class GdmLiveAudio extends LitElement {
   }
 
   private reset() {
-    this.session?.close();
+    if (this.liveSocket) {
+      try {
+        this.liveSocket.close();
+      } catch {
+        // Ignore close errors
+      }
+      this.liveSocket = null;
+    }
+    this.liveConnectPromise = null;
     this.initSession();
     this.updateStatus('Session reset with gemini-3.8-live.');
   }
@@ -1579,10 +1724,27 @@ export class GdmLiveAudio extends LitElement {
 
     return html`
       <div>
+        ${this.mapsQuotaExceeded
+          ? html`
+              <div class="gmp-quota-banner" role="alert">
+                <span>
+                  Google Maps Platform quota reached. If you are the app owner, visit
+                  <a
+                    href="https://developers.google.com/maps/ai/ai-studio?utm_campaign=gmp_mcp_codeassist_v1_aistudio#quota_exceeded_errors"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    >maps developer site</a
+                  >
+                  for instructions to update your account.
+                </span>
+              </div>
+            `
+          : ''}
+
         <!-- ================================================================
              Clean Professional Header
              ================================================================ -->
-        <header class="app-header">
+        <header class="app-header ${this.mapsQuotaExceeded ? 'has-banner' : ''}">
           <!-- Left: Application Name/Logo and Status -->
           <div class="header-left">
             <a href="#" class="brand-link" @click=${(e: Event) => e.preventDefault()}>
@@ -1621,7 +1783,7 @@ export class GdmLiveAudio extends LitElement {
               class="header-btn ${this.isGroundingDrawerOpen && this.activeGroundingTab === 'search'
                 ? 'active'
                 : ''}"
-              title="Google Search Grounding (gemini-3.5-flash)"
+              title="Google Search Grounding (gemini-4-hydrogen)"
               @click=${() => this.openDrawer('search')}
             >
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1636,7 +1798,7 @@ export class GdmLiveAudio extends LitElement {
               class="header-btn ${this.isGroundingDrawerOpen && this.activeGroundingTab === 'maps'
                 ? 'active'
                 : ''}"
-              title="Google Maps Grounding (gemini-3.5-flash)"
+              title="Google Maps Grounding (gemini-4-hydrogen)"
               @click=${() => this.openDrawer('maps')}
             >
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1771,7 +1933,7 @@ export class GdmLiveAudio extends LitElement {
           : ''}
 
         <!-- Two-Row Responsive Audio Control Panel -->
-        <div class="control-panel">
+        <div class="control-panel ${this.isDockCollapsed ? 'collapsed' : ''}">
           <!-- Row 1: Audio Category Indicators (Equal-width Grid Columns) -->
           <div class="audio-metrics">
             <div class="metric bass">
@@ -1916,8 +2078,16 @@ export class GdmLiveAudio extends LitElement {
           </span>
 
           <span class="status-separator">•</span>
-          <span class="status-hint-info">Drag to rotate • Audio reactive</span>
+          <span class="status-hint-info">Drag to rotate • Press H for Zen Mode</span>
         </div>
+
+        <button
+          class="zen-toggle-btn ${this.mapsQuotaExceeded ? 'has-banner' : ''}"
+          title="Toggle Control Dock (H)"
+          @click=${() => (this.isDockCollapsed = !this.isDockCollapsed)}
+        >
+          ${this.isDockCollapsed ? '▴ Show Controls' : '▾ Zen Mode'}
+        </button>
 
         <!-- 3D Audio-Reactive Orb Main View -->
         ${this.visualizerMode === 'reactive-orb'
@@ -1999,110 +2169,62 @@ export class GdmLiveAudio extends LitElement {
           </div>
 
           <div class="drawer-body">
-            <!-- TAB 1 & 2: Search & Maps Grounding -->
-            ${this.activeGroundingTab === 'search' || this.activeGroundingTab === 'maps'
+            <!-- TAB 1: Search Grounding -->
+            ${this.activeGroundingTab === 'search'
               ? html`
                   <div class="query-input-box">
                     <input
                       type="text"
                       class="query-input"
-                      placeholder=${this.activeGroundingTab === 'search'
-                        ? 'Ask Search: e.g. Latest science discoveries...'
-                        : 'Ask Maps: e.g. Best local coffee shops nearby...'}
+                      placeholder="Ask Search: e.g. Latest science discoveries..."
                       .value=${this.groundingQuery}
                       @input=${(e: Event) =>
                         (this.groundingQuery = (e.target as HTMLInputElement).value)}
                       @keydown=${(e: KeyboardEvent) => {
                         if (e.key === 'Enter') {
-                          if (this.activeGroundingTab === 'search') {
-                            this.handleSearchGrounding();
-                          } else {
-                            this.handleMapsGrounding();
-                          }
+                          this.handleSearchGrounding();
                         }
                       }}
                     />
                     <button
                       class="query-submit-btn"
                       ?disabled=${this.isGroundingLoading || !this.groundingQuery.trim()}
-                      @click=${() => {
-                        if (this.activeGroundingTab === 'search') {
-                          this.handleSearchGrounding();
-                        } else {
-                          this.handleMapsGrounding();
-                        }
-                      }}
+                      @click=${() => this.handleSearchGrounding()}
                     >
                       ${this.isGroundingLoading ? '...' : 'Ask'}
                     </button>
                   </div>
 
                   <div class="suggested-chips">
-                    <span class="chips-label">
-                      ${this.activeGroundingTab === 'search'
-                        ? 'Google Search Suggestions (gemini-3.5-flash)'
-                        : 'Google Maps Suggestions (gemini-3.5-flash)'}
-                    </span>
+                    <span class="chips-label">Google Search Suggestions (gemini-4-hydrogen)</span>
                     <div class="chip-list">
-                      ${this.activeGroundingTab === 'search'
-                        ? html`
-                            <button
-                              class="chip"
-                              @click=${() => {
-                                this.groundingQuery = 'Latest breaking world tech news today';
-                                this.handleSearchGrounding('Latest breaking world tech news today');
-                              }}
-                            >
-                              Tech News
-                            </button>
-                            <button
-                              class="chip"
-                              @click=${() => {
-                                this.groundingQuery = 'What are the current top astronomy discoveries?';
-                                this.handleSearchGrounding('What are the current top astronomy discoveries?');
-                              }}
-                            >
-                              Astronomy Discoveries
-                            </button>
-                            <button
-                              class="chip"
-                              @click=${() => {
-                                this.groundingQuery = 'Recent advances in quantum computing';
-                                this.handleSearchGrounding('Recent advances in quantum computing');
-                              }}
-                            >
-                              Quantum Computing
-                            </button>
-                          `
-                        : html`
-                            <button
-                              class="chip"
-                              @click=${() => {
-                                this.groundingQuery = 'Find top-rated specialty coffee shops nearby';
-                                this.handleMapsGrounding('Find top-rated specialty coffee shops nearby');
-                              }}
-                            >
-                              Coffee Nearby
-                            </button>
-                            <button
-                              class="chip"
-                              @click=${() => {
-                                this.groundingQuery = 'Scenic nature viewpoints and botanical gardens';
-                                this.handleMapsGrounding('Scenic nature viewpoints and botanical gardens');
-                              }}
-                            >
-                              Scenic Gardens
-                            </button>
-                            <button
-                              class="chip"
-                              @click=${() => {
-                                this.groundingQuery = 'Top historic landmarks and museums to visit';
-                                this.handleMapsGrounding('Top historic landmarks and museums to visit');
-                              }}
-                            >
-                              Landmarks & Museums
-                            </button>
-                          `}
+                      <button
+                        class="chip"
+                        @click=${() => {
+                          this.groundingQuery = 'Latest breaking world tech news today';
+                          this.handleSearchGrounding('Latest breaking world tech news today');
+                        }}
+                      >
+                        Tech News
+                      </button>
+                      <button
+                        class="chip"
+                        @click=${() => {
+                          this.groundingQuery = 'What are the current top astronomy discoveries?';
+                          this.handleSearchGrounding('What are the current top astronomy discoveries?');
+                        }}
+                      >
+                        Astronomy Discoveries
+                      </button>
+                      <button
+                        class="chip"
+                        @click=${() => {
+                          this.groundingQuery = 'Recent advances in quantum computing';
+                          this.handleSearchGrounding('Recent advances in quantum computing');
+                        }}
+                      >
+                        Quantum Computing
+                      </button>
                     </div>
                   </div>
 
@@ -2110,11 +2232,7 @@ export class GdmLiveAudio extends LitElement {
                     ? html`
                         <div class="loading-pulse">
                           <div class="spinner"></div>
-                          <span>
-                            Grounded via
-                            ${this.activeGroundingTab === 'search' ? 'Google Search' : 'Google Maps'}
-                            (gemini-3.5-flash)...
-                          </span>
+                          <span>Grounded via Google Search (gemini-4-hydrogen)...</span>
                         </div>
                       `
                     : ''}
@@ -2131,11 +2249,7 @@ export class GdmLiveAudio extends LitElement {
                     ? html`
                         <div class="result-card">
                           <div class="result-header">
-                            <span class="model-tag">
-                              ${this.groundingResult.type === 'search'
-                                ? 'Google Search Grounded • gemini-3.5-flash'
-                                : 'Google Maps Grounded • gemini-3.5-flash'}
-                            </span>
+                            <span class="model-tag">Google Search Grounded • gemini-4-hydrogen</span>
                             <button
                               class="speak-btn"
                               title="Read answer aloud to make the 3D orb dance"
@@ -2168,9 +2282,7 @@ export class GdmLiveAudio extends LitElement {
                                       <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
                                       <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
                                     </svg>
-                                    ${this.groundingResult.type === 'search'
-                                      ? 'Web Sources'
-                                      : 'Google Maps Places'}
+                                    Web Sources
                                   </div>
 
                                   ${this.groundingResult.sources.map(
@@ -2181,10 +2293,7 @@ export class GdmLiveAudio extends LitElement {
                                         rel="noopener noreferrer"
                                         class="source-item"
                                       >
-                                        <div class="source-title">
-                                          ${src.type === 'maps' ? '📍' : '🔗'}
-                                          ${src.title}
-                                        </div>
+                                        <div class="source-title">🔗 ${src.title}</div>
                                         <div class="source-url">${src.uri}</div>
                                         ${src.snippet
                                           ? html`<div class="source-snippet">${src.snippet}</div>`
@@ -2198,6 +2307,82 @@ export class GdmLiveAudio extends LitElement {
                         </div>
                       `
                     : ''}
+                `
+              : this.activeGroundingTab === 'maps'
+              ? html`
+                  <!-- TAB 2: Interactive Google Maps Platform Explorer -->
+                  <maps-explorer
+                    @placessearched=${(e: CustomEvent) => {
+                      const d = e.detail || {};
+                      if (d.query) {
+                        this.addTranscript(
+                          'system',
+                          `[Google Maps] Found ${d.count ?? 0} places for "${d.query}"${d.topName ? ` (top: ${d.topName})` : ''}.`,
+                        );
+                      }
+                    }}
+                  ></maps-explorer>
+
+                  <div style="border-top: 1px solid rgba(255, 255, 255, 0.08); padding-top: 0.9rem; display: flex; flex-direction: column; gap: 0.65rem;">
+                    <span class="chips-label">AI Local Guide (Gemini Maps Grounding)</span>
+                    <div class="query-input-box">
+                      <input
+                        type="text"
+                        class="query-input"
+                        placeholder="Ask Gemini Maps: e.g. Best coffee nearby..."
+                        .value=${this.groundingQuery}
+                        @input=${(e: Event) =>
+                          (this.groundingQuery = (e.target as HTMLInputElement).value)}
+                        @keydown=${(e: KeyboardEvent) => {
+                          if (e.key === 'Enter') {
+                            this.handleMapsGrounding();
+                          }
+                        }}
+                      />
+                      <button
+                        class="query-submit-btn"
+                        ?disabled=${this.isGroundingLoading || !this.groundingQuery.trim()}
+                        @click=${() => this.handleMapsGrounding()}
+                      >
+                        ${this.isGroundingLoading ? '...' : 'Ask'}
+                      </button>
+                    </div>
+
+                    ${this.isGroundingLoading
+                      ? html`
+                          <div class="loading-pulse">
+                            <div class="spinner"></div>
+                            <span>Grounded via Google Maps (gemini-4-hydrogen)...</span>
+                          </div>
+                        `
+                      : ''}
+
+                    ${this.groundingError
+                      ? html`
+                          <div style="color: #f87171; font-size: 0.8rem; padding: 0.5rem; background: rgba(239, 68, 68, 0.1); border-radius: 8px;">
+                            ⚠️ ${this.groundingError}
+                          </div>
+                        `
+                      : ''}
+
+                    ${this.groundingResult && this.groundingResult.type === 'maps'
+                      ? html`
+                          <div class="result-card">
+                            <div class="result-header">
+                              <span class="model-tag">Google Maps Grounded • gemini-4-hydrogen</span>
+                              <button
+                                class="speak-btn"
+                                title="Read answer aloud to make the 3D orb dance"
+                                @click=${this.speakGroundedAnswer}
+                              >
+                                ${this.isSpeakingGrounding ? '⏹ Stop' : '🔊 Speak to Orb'}
+                              </button>
+                            </div>
+                            <div class="result-text">${this.groundingResult.text}</div>
+                          </div>
+                        `
+                      : ''}
+                  </div>
                 `
               : this.activeGroundingTab === 'customize'
               ? html`
@@ -2317,7 +2502,7 @@ export class GdmLiveAudio extends LitElement {
                         <div>• Input Mic Sample Rate: <span style="color: #e2e8f0;">16,000 Hz PCM</span></div>
                         <div>• Output Voice Sample Rate: <span style="color: #e2e8f0;">24,000 Hz PCM</span></div>
                         <div>• Spectral Analysis: <span style="color: #e2e8f0;">64-band FFT (Bass, Mid, Treble)</span></div>
-                        <div>• Grounding Model: <span style="color: #10b981;">gemini-3.5-flash</span></div>
+                        <div>• Grounding Model: <span style="color: #10b981;">gemini-4-hydrogen</span></div>
                       </div>
                     </div>
                   </div>
